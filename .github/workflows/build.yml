@@ -29,8 +29,9 @@ jobs:
       matrix:
         build: ${{ fromJson(needs.plan.outputs.builds) }}
     env:
-      BETAFLIGHT: ${{ matrix.build.betaflight }}
-      TARGET: ${{ matrix.build.target }}
+      # Not TARGET: make reads the environment, and TARGET is a Betaflight make variable.
+      BF_RELEASE: ${{ matrix.build.betaflight }}
+      BOARD: ${{ matrix.build.target }}
       BUILD_JSON: ${{ toJson(matrix.build) }}
     steps:
       - name: Check out this repository
@@ -52,13 +53,13 @@ jobs:
         run: |
           patches=$(jq -r '.patches[]' <<< "$BUILD_JSON")
           for patch in $patches; do
-            git apply --verbose "../fcm/patches/$BETAFLIGHT/$patch"
+            git apply --verbose "../fcm/patches/$BF_RELEASE/$patch"
           done
           export GIT_AUTHOR_NAME=fc-migrate GIT_AUTHOR_EMAIL=noreply@fc-migrate.com
           export GIT_COMMITTER_NAME=fc-migrate GIT_COMMITTER_EMAIL=noreply@fc-migrate.com
           export GIT_AUTHOR_DATE="$(git log -1 --format=%cI)" GIT_COMMITTER_DATE="$(git log -1 --format=%cI)"
           git add -A
-          git commit -q -m "fc-migrate patches for $BETAFLIGHT" -m "$(printf '%s\n' $patches)"
+          git commit -q -m "fc-migrate patches for $BF_RELEASE" -m "$(printf '%s\n' $patches)"
           git log --oneline -2
 
       - name: Fetch the submodules the build needs
@@ -79,18 +80,18 @@ jobs:
         working-directory: betaflight
         run: |
           flags=$(jq -r '.options | map("-D" + .) | join(" ")' <<< "$BUILD_JSON")
-          make -j"$(nproc)" CONFIG="$TARGET" CONFIG_DIR="$GITHUB_WORKSPACE/fcm" EXTRA_FLAGS="$flags"
+          make -j"$(nproc)" CONFIG="$BOARD" CONFIG_DIR="$GITHUB_WORKSPACE/fcm" EXTRA_FLAGS="$flags"
 
       - name: Describe the build
         run: |
-          hex=$(ls betaflight/obj/*_"$TARGET".hex)
+          hex=$(ls betaflight/obj/*_"$BOARD".hex)
           mkdir -p out
           cp "$hex" out/
           name=$(basename "$hex")
           jq -n \
             --arg file "$name" \
             --arg sha256 "$(sha256sum "$hex" | cut -d' ' -f1)" \
-            --arg betaflight "$BETAFLIGHT" \
+            --arg betaflight "$BF_RELEASE" \
             --arg betaflightCommit "$(git -C betaflight rev-parse HEAD~1)" \
             --arg revision "$(git -C betaflight rev-parse --short=9 HEAD)" \
             --arg source "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/tree/$GITHUB_SHA" \
