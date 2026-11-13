@@ -1,0 +1,137 @@
+name: Build firmware
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      builds: ${{ steps.read.outputs.builds }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        run: echo "builds=$(jq -c '.builds' builds.json)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    name: ${{ matrix.build.target }} on Betaflight ${{ matrix.build.betaflight }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        build: ${{ fromJson(needs.plan.outputs.builds) }}
+    env:
+      BETAFLIGHT: ${{ matrix.build.betaflight }}
+      TARGET: ${{ matrix.build.target }}
+      BUILD_JSON: ${{ toJson(matrix.build) }}
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+        with:
+          path: fcm
+
+      - name: Check out Betaflight ${{ matrix.build.betaflight }}
+        uses: actions/checkout@v4
+        with:
+          repository: betaflight/betaflight
+          ref: ${{ matrix.build.betaflight }}
+          path: betaflight
+
+      # The patches are committed with fixed metadata, so the revision the firmware
+      # reports is the same on every run and identifies this exact patched source.
+      - name: Apply patches
+        working-directory: betaflight
+        run: |
+          patches=$(jq -r '.patches[]' <<< "$BUILD_JSON")
+          for patch in $patches; do
+            git apply --verbose "../fcm/patches/$BETAFLIGHT/$patch"
+          done
+          export GIT_AUTHOR_NAME=fc-migrate GIT_AUTHOR_EMAIL=noreply@fc-migrate.com
+          export GIT_COMMITTER_NAME=fc-migrate GIT_COMMITTER_EMAIL=noreply@fc-migrate.com
+          export GIT_AUTHOR_DATE="$(git log -1 --format=%cI)" GIT_COMMITTER_DATE="$(git log -1 --format=%cI)"
+          git add -A
+          git commit -q -m "fc-migrate patches for $BETAFLIGHT" -m "$(printf '%s\n' $patches)"
+          git log --oneline -2
+
+      - name: Fetch the submodules the build needs
+        working-directory: betaflight
+        run: git submodule update --init src/config lib/modules/dronecan/libcanard
+
+      - name: Cache the ARM toolchain
+        uses: actions/cache@v4
+        with:
+          path: betaflight/tools
+          key: arm-sdk-${{ hashFiles('betaflight/mk/tools.mk') }}
+
+      - name: Install the ARM toolchain
+        working-directory: betaflight
+        run: make arm_sdk_install
+
+      - name: Build
+        working-directory: betaflight
+        run: |
+          flags=$(jq -r '.options | map("-D" + .) | join(" ")' <<< "$BUILD_JSON")
+          make -j"$(nproc)" CONFIG="$TARGET" CONFIG_DIR="$GITHUB_WORKSPACE/fcm" EXTRA_FLAGS="$flags"
+
+      - name: Describe the build
+        run: |
+          hex=$(ls betaflight/obj/*_"$TARGET".hex)
+          mkdir -p out
+          cp "$hex" out/
+          name=$(basename "$hex")
+          jq -n \
+            --arg file "$name" \
+            --arg sha256 "$(sha256sum "$hex" | cut -d' ' -f1)" \
+            --arg betaflight "$BETAFLIGHT" \
+            --arg betaflightCommit "$(git -C betaflight rev-parse HEAD~1)" \
+            --arg revision "$(git -C betaflight rev-parse --short=9 HEAD)" \
+            --arg source "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/tree/$GITHUB_SHA" \
+            --arg toolchain "$(betaflight/tools/arm-gnu-toolchain-*/bin/arm-none-eabi-gcc -dumpversion)" \
+            --argjson build "$BUILD_JSON" \
+            '{file: $file, sha256: $sha256, target: $build.target, betaflight: $betaflight,
+              betaflightCommit: $betaflightCommit, revision: $revision, patches: $build.patches,
+              options: $build.options, source: $source, toolchain: $toolchain}' \
+            > "out/${name%.hex}.json"
+          cat out/*.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.build.target }}-${{ matrix.build.betaflight }}
+          path: out/
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd out
+          sha256sum *.hex > SHA256SUMS
+          {
+            echo "Unofficial Betaflight builds for boards Betaflight does not build yet. Source: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/tree/$GITHUB_REF_NAME"
+            echo
+            echo "| File | Betaflight | Patches | Reports revision | SHA-256 |"
+            echo "|---|---|---|---|---|"
+            for info in *.json; do
+              jq -r '"| \(.file) | \(.betaflight) | \(.patches | join(", ")) | \(.revision) | `\(.sha256)` |"' "$info"
+            done
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes-file notes.md *.hex *.json SHA256SUMS

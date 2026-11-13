@@ -1,0 +1,38 @@
+STM32G4: turn on the ADC's hardware oversampler
+
+Betaflight's G4 ADC driver feeds single conversions to the voltage filter.
+On the T-Motor Pacer G4 Alpha HD the battery-sense pin (PA0) is noisy enough
+(raw SD about 2 V on a steady 22.9 V supply, samples from 0 to 40 V) that the
+3 s display filter never settles within the 0.1 V that voltageIsStable()
+needs, so the cell count stays at 0: the OSD shows 0.00 average cell and the
+low-battery warnings have no threshold.
+
+Averaging 256 conversions per result (shifted right 8, still 12-bit) took the
+raw SD to 0.13 V and the filtered SD to 0.016 V. The stability test then
+passed 100% of the time, and 6S locked 3.6 s after power came up. At
+640.5-cycle sampling and fADC = 42 MHz each result takes about 4 ms per
+channel, well inside the 50 Hz battery task.
+
+Applies to Betaflight 2026.6.2 (master is identical for this file as of
+2026-11-11). From the root of the Betaflight source:
+
+    patch -p1 < stm32g4-adc-oversampling.patch
+
+--- a/src/platform/STM32/adc_stm32g4xx.c
++++ b/src/platform/STM32/adc_stm32g4xx.c
+@@ -222,7 +222,14 @@
+     hadc->Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+     hadc->Init.DMAContinuousRequests = ENABLE;
+     hadc->Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
+-    hadc->Init.OversamplingMode = DISABLE;
++    // Average 256 conversions in hardware for each result, shifted back to 12 bits. At 640.5-cycle
++    // sampling and fADC = 42 MHz that is about 4 ms per channel, so a full scan still lands well
++    // inside one 50 Hz voltage-task period, and spikes on a noisy divider average out.
++    hadc->Init.OversamplingMode = ENABLE;
++    hadc->Init.Oversampling.Ratio = ADC_OVERSAMPLING_RATIO_256;
++    hadc->Init.Oversampling.RightBitShift = ADC_RIGHTBITSHIFT_8;
++    hadc->Init.Oversampling.TriggeredMode = ADC_TRIGGEREDMODE_SINGLE_TRIGGER;
++    hadc->Init.Oversampling.OversamplingStopReset = ADC_REGOVERSAMPLING_CONTINUED_MODE;
+ 
+     if (HAL_ADC_Init(hadc) != HAL_OK) {
+         handleError();
