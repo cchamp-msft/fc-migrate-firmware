@@ -1,0 +1,65 @@
+STM32G4: keep the ROM bootloader on USB (USE_ROM_BOOTLOADER_NO_USART)
+
+ST's ROM bootloader on the STM32G4 listens on USART1 (PA9/PA10), USART2
+(PA2/PA3) and USART3 (PC10/PC11) as well as USB DFU. The first byte on one of
+those USARTs makes it commit to that USART and switch USB off, and Windows then
+shows "Unknown USB Device (Device Descriptor Request Failed)". On the T-Motor
+Pacer G4 Alpha Analog, the OSD co-processor sends MSP requests on PC11 about
+every 36 ms, which is sooner than a host resets a newly attached device, so
+`bl` almost never reaches DFU there.
+
+The bootloader resets the GPIO ports as it starts, so the pins can't be held
+off from Betaflight, but it keeps RCC_CCIPR. This patch gives the three USARTs
+the LSE as kernel clock just before the jump. With the LSE stopped (this
+board has no 32 kHz crystal), they never receive a byte, and USB wins. A
+system reset clears CCIPR again, so Betaflight's own UARTs are unaffected.
+Nothing changes when the LSE is running, or for boards that don't define
+USE_ROM_BOOTLOADER_NO_USART.
+
+Tested on the Analog board (STM32G473) on 2026-11-17:
+- Betaflight's jump made by hand over SWD: DFU enumerated 7 times out of 7
+  with USART3 starved (USART1 too in two of them), and failed 4 times out
+  of 4 without.
+- Built in, with Betaflight's own `bl`: DFU came up within a second 15
+  times out of 15: with an SWD probe attached, with it removed and the
+  battery on, and on USB alone. A firmware write through DFU then kept the
+  settings.
+
+Applies to Betaflight 2026.6.2. From the root of the Betaflight source:
+
+    patch -p1 < stm32g4-rom-bootloader-no-usart.patch
+
+--- a/src/platform/STM32/system_stm32g4xx.c
++++ b/src/platform/STM32/system_stm32g4xx.c
+@@ -110,11 +110,31 @@
+     resetHandler_t *resetHandler;
+ } isrVector_t;
+ 
++#ifdef USE_ROM_BOOTLOADER_NO_USART
++// ST's ROM bootloader listens on USART1 (PA9/PA10), USART2 (PA2/PA3) and USART3 (PC10/PC11) as
++// well as USB, and the first byte it receives on one of those USARTs makes it drop USB. A device
++// that talks on those pins on its own, such as an OSD co-processor or a linked receiver, then stops
++// DFU from ever enumerating. The bootloader resets the GPIO ports but keeps RCC_CCIPR, so give the
++// three USARTs the LSE as kernel clock: while the LSE is stopped they never receive a byte.
++static void romBootloaderStopUsarts(void)
++{
++    if (RCC->BDCR & RCC_BDCR_LSERDY) {
++        return;
++    }
++    const uint32_t usartSel = RCC_CCIPR_USART1SEL | RCC_CCIPR_USART2SEL | RCC_CCIPR_USART3SEL;
++    MODIFY_REG(RCC->CCIPR, usartSel, usartSel);
++}
++#endif
++
+ static void systemJumpToBootloader(void)
+ {
+     //DeInit all used peripherals
+     HAL_RCC_DeInit();
+ 
++#ifdef USE_ROM_BOOTLOADER_NO_USART
++    romBootloaderStopUsarts();
++#endif
++
+     //Disable all system timers and set to default values
+     SysTick->CTRL = 0;
+     SysTick->LOAD = 0;
