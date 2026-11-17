@@ -26,8 +26,8 @@
  * Pins are carried over from TMOTORG4ALPHAHD. This board shipped with an unreleased Alpha (0.1-152)
  * that is read-protected, so it couldn't be emulated the way the HD board's 0.7.73 was. Checked on one
  * converted board, on the bench: gyro detection, the OSD on UART4, SmartAudio on UART3, the receiver on
- * UART1, ESC telemetry on LPUART1, motor order and battery voltage. Not checked yet: the beeper, the
- * LEDs, the LED strip and gyro alignment. Not flown yet.
+ * UART1, ESC telemetry on LPUART1, motor order, battery voltage and USB DFU after `bl`. Not checked
+ * yet: the beeper, the LEDs, the LED strip and gyro alignment. Not flown yet.
  *
  * OSD: the G071 takes MSP DisplayPort and draws it over analog video. Under Alpha it sat on Alpha's
  * SERIAL 4 (disabling that port blanked the OSD), which is UART4 (PC10/PC11) on the HD board. Build
@@ -36,7 +36,8 @@
  * the 13-row NTSC canvas.
  *
  * No DJI plug, and listings give this board a 5 V output only, so the HD board's PC6-switched
- * regulator is left out until PC6 is checked here.
+ * regulator is left out. Checked here: PC6 has no external pull-up, and driving it low or high
+ * changed neither the video nor the OSD co-processor.
  *
  * PB8 is both UART3 RX and BOOT0, and this board has no R3 pad. Keep option byte nSWBOOT0 at 0.
  */
@@ -133,6 +134,10 @@
 // flicker and loses elements drawn early in the frame. This sends only the changed characters instead.
 // Needs patches/2026.6.2/msp-displayport-diff.patch.
 #define USE_MSP_DISPLAYPORT_DIFF
+// The co-processor also polls on PC11, one of the ROM bootloader's USART3 pins, so `bl` lands in a
+// bootloader that has given up on USB. This starves the bootloader's USARTs so DFU enumerates.
+// Needs patches/2026.6.2/stm32g4-rom-bootloader-no-usart.patch.
+#define USE_ROM_BOOTLOADER_NO_USART
 #define SERIALRX_UART           SERIAL_PORT_USART1    // CRSF by default
 #define VTX_SMARTAUDIO_UART     SERIAL_PORT_USART3    // TX3 only
 #define ESC_SENSOR_UART         SERIAL_PORT_LPUART1   // ESC plugs' TLM line

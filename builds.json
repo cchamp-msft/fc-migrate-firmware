@@ -21,7 +21,7 @@
     {
       "betaflight": "2026.6.2",
       "target": "TMOTORG4ALPHAANALOG",
-      "patches": ["stm32g4-adc-oversampling.patch", "stm32g4-lpuart1-init.patch", "msp-displayport-diff.patch"],
+      "patches": ["stm32g4-adc-oversampling.patch", "stm32g4-lpuart1-init.patch", "msp-displayport-diff.patch", "stm32g4-rom-bootloader-no-usart.patch"],
       "options": [
         "CLOUD_BUILD",
         "USE_SERIALRX",

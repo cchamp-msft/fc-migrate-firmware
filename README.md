@@ -9,11 +9,11 @@ This is not a Betaflight project and is not endorsed by it. Each board here is m
 | Board | Config | Betaflight | Patches | Status |
 |---|---|---|---|---|
 | T-Motor Pacer G4 Alpha HD (STM32G473) | [`configs/COMM/TMOTORG4ALPHAHD`](configs/COMM/TMOTORG4ALPHAHD/config.h) | 2026.6.2 | ADC oversampling, LPUART1 backport | Flown. Not yet proposed upstream. |
-| T-Motor Pacer G4 Alpha Analog (STM32G473, STM32G071 OSD chip) | [`configs/COMM/TMOTORG4ALPHAANALOG`](configs/COMM/TMOTORG4ALPHAANALOG/config.h) | 2026.6.2 | ADC oversampling, LPUART1 backport, MSP DisplayPort diff | Bench-tested on one board, not flown yet. Not yet proposed upstream. |
+| T-Motor Pacer G4 Alpha Analog (STM32G473, STM32G071 OSD chip) | [`configs/COMM/TMOTORG4ALPHAANALOG`](configs/COMM/TMOTORG4ALPHAANALOG/config.h) | 2026.6.2 | ADC oversampling, LPUART1 backport, MSP DisplayPort diff, ROM bootloader USB fix | Bench-tested on one board, not flown yet. Not yet proposed upstream. |
 
-Both boards ship with closed firmware and a locked chip. Moving one to Betaflight is a one-way change, made with an ST-Link through [fc-migrate.com](https://fc-migrate.com).
+Both boards ship with closed firmware and a locked chip. Moving one to Betaflight is a one-way change, made over SWD through [fc-migrate.com](https://fc-migrate.com) with an ST-Link, a Flipper Zero or a Pico running debugprobe.
 
-The Analog board's OSD is a separate STM32G071 running FETtec's OSD firmware, which takes MSP DisplayPort on UART4. Its build uses the SD canvas (`USE_OSD_SD`, not `USE_OSD_HD`) and needs the MSP DisplayPort diff patch. After a `bl` command it did not come up as a USB DFU device, so it is updated over SWD.
+The Analog board's OSD is a separate STM32G071 running FETtec's OSD firmware, which takes MSP DisplayPort on UART4. Its build uses the SD canvas (`USE_OSD_SD`, not `USE_OSD_HD`) and needs the MSP DisplayPort diff patch. The OSD chip also polls on PC11, one of the pins ST's USB bootloader listens on as a serial port, so after a `bl` command the bootloader chose that port and switched USB off. From v2026.6.2-3 the build keeps the bootloader on USB, so the board updates over USB DFU like any other. A board still on an earlier build needs one update over SWD to get there.
 
 ### Manufacturer ID
 
@@ -28,6 +28,7 @@ Each Betaflight release has its own folder under `patches/`. Every patch starts 
 | `stm32g4-adc-oversampling.patch` | Averages 256 conversions in the G4 ADC's hardware oversampler. Without it, the Alpha HD's noisy battery-sense pin never settles, so the cell count stays at 0 and low-battery warnings never fire. Results stay 12-bit, so `vbat_scale` is unchanged. | To be proposed. |
 | `stm32g4-lpuart1-init.patch` | Starts LPUART1, the Alpha HD's ESC telemetry line, which 2026.6.2 never initialises. | Backport of Betaflight PR #15723, already on master. |
 | `msp-displayport-diff.patch` | The Analog board's OSD chip acts on CLEAR_SCREEN as soon as it arrives, so Betaflight's clear on every OSD frame makes it flicker and hides some elements. With `USE_MSP_DISPLAYPORT_DIFF` defined, the FC sends only the characters that changed. Without the define, the file builds as before. Analog board only. | To be proposed. |
+| `stm32g4-rom-bootloader-no-usart.patch` | ST's ROM bootloader also listens on USART1-3, and the first byte on one of them makes it switch USB off. On the Analog board the OSD chip polls on PC11 (USART3), so `bl` never reached DFU. With `USE_ROM_BOOTLOADER_NO_USART` defined, Betaflight gives those USARTs the stopped LSE as clock just before the jump, which the bootloader keeps, so they never receive a byte. Without the define, the file builds as before. Analog board only for now. | To be proposed. |
 
 ## How a build is made
 
@@ -53,7 +54,7 @@ make CONFIG=TMOTORG4ALPHAHD CONFIG_DIR="$PWD/../fc-migrate-firmware" \
   EXTRA_FLAGS="-DCLOUD_BUILD -DUSE_SERIALRX -DUSE_SERIALRX_CRSF -DUSE_SERIALRX_SBUS -DUSE_TELEMETRY -DUSE_TELEMETRY_CRSF -DUSE_OSD_HD -DUSE_DSHOT -DUSE_LED_STRIP -DUSE_PINIO -DUSE_VTX"
 ```
 
-For the Alpha Analog, also apply `msp-displayport-diff.patch`, and build with `CONFIG=TMOTORG4ALPHAANALOG` and `-DUSE_OSD_SD` in place of `-DUSE_OSD_HD`. [`builds.json`](builds.json) lists each build's patches and options.
+For the Alpha Analog, also apply `msp-displayport-diff.patch` and `stm32g4-rom-bootloader-no-usart.patch`, and build with `CONFIG=TMOTORG4ALPHAANALOG` and `-DUSE_OSD_SD` in place of `-DUSE_OSD_HD`. [`builds.json`](builds.json) lists each build's patches and options.
 
 The firmware lands in `obj/`. Without the commit in step 2, it reports `norevision`.
 
