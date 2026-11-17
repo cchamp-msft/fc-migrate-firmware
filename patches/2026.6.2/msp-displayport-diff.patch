@@ -1,0 +1,338 @@
+MSP DisplayPort: send only what changed, for devices that clear at once
+
+Betaflight's OSD sends CLEAR_SCREEN, then every element, then DRAW_SCREEN
+on each frame, expecting the device to show the result at DRAW_SCREEN.
+FETtec's G0 OSD chip on the T-Motor Pacer G4 Alpha Analog (an STM32G071
+running FETtec's Alpha OSD 0.1.18, on UART4) acts on CLEAR_SCREEN as soon
+as it arrives. With elements turned on, the OSD flickers at the default
+12 Hz and the right side is worst. Timer 2, the vtx channel and throttle
+never show: they come early in the draw order, so the clear probably wipes
+them before the G0 shows them.
+
+A grid of digits sent straight to the G0 stays steady when redrawn at 4 or
+12 Hz without CLEAR_SCREEN, and blinks when redrawn at 4 Hz with
+CLEAR_SCREEN first.
+
+With USE_MSP_DISPLAYPORT_DIFF defined, the FC keeps the screen it wants and
+the screen it has sent, and sends only the changed characters, with spaces
+where text went away. CLEAR_SCREEN goes out only to resync: at start-up,
+after a release, and on a redraw. One row is resent in full every frame, so
+the device catches up after a lost string. CMS menus are flushed on commit,
+since they never call DRAW_SCREEN. Without the define, the file builds as
+before.
+
+Tested 2026-11-16 on an Alpha Analog with a PAL camera: the OSD is steady,
+and timer 2, the vtx channel and throttle all show. Settings saved before
+the change survived it (`diff all` identical).
+
+Applies to Betaflight 2026.6.2. From the root of the Betaflight source:
+
+    patch -p1 < msp-displayport-diff.patch
+
+--- a/src/main/io/displayport_msp.c
++++ b/src/main/io/displayport_msp.c
+@@ -29,6 +29,7 @@
+ 
+ #include "cli/cli.h"
+ 
++#include "common/maths.h"
+ #include "common/utils.h"
+ 
+ #include "drivers/display.h"
+@@ -79,59 +80,246 @@
+     return heartbeat(displayPort);
+ }
+ 
++#define MSP_OSD_MAX_STRING_LENGTH 30 // FIXME move this
++
++static uint8_t mspAttribute(uint8_t attr)
++{
++    uint8_t mspAttr = displayPortProfileMsp()->fontSelection[attr & (DISPLAYPORT_SEVERITY_COUNT - 1)] & DISPLAYPORT_MSP_ATTR_FONT;
++
++    if (attr & DISPLAYPORT_BLINK) {
++        mspAttr |= DISPLAYPORT_MSP_ATTR_BLINK;
++    }
++
++    return mspAttr;
++}
++
++static int sendString(displayPort_t *displayPort, uint8_t col, uint8_t row, uint8_t mspAttr, const uint8_t *chars, int len)
++{
++    uint8_t buf[MSP_OSD_MAX_STRING_LENGTH + 4];
++
++    if (len > MSP_OSD_MAX_STRING_LENGTH) {
++        len = MSP_OSD_MAX_STRING_LENGTH;
++    }
++
++    buf[0] = MSP_DP_WRITE_STRING;
++    buf[1] = row;
++    buf[2] = col;
++    buf[3] = mspAttr;
++
++    memcpy(&buf[4], chars, len);
++
++    return output(displayPort, MSP_DISPLAYPORT, buf, len + 4);
++}
++
++static int screenSize(const displayPort_t *displayPort)
++{
++    return displayPort->rows * displayPort->cols;
++}
++
++#ifdef USE_MSP_DISPLAYPORT_DIFF
++// Some MSP DisplayPort devices act on CLEAR_SCREEN when it arrives rather than at DRAW_SCREEN, so the
++// OSD's clear-and-redraw on every frame blanks them every frame, and text written just after the clear
++// can be wiped before it is seen (FETtec's G0 analog OSD). Here the FC keeps the screen it wants and the
++// screen it has sent, and sends only the characters that changed, writing spaces where text went away.
++// CLEAR_SCREEN goes out only to resync: at start-up, after a release, and on a redraw. One row is sent
++// again in full on every frame, so the device catches up by itself after a lost string or its own reset.
++
++#ifdef USE_OSD_HD
++#define DIFF_ROWS 31    // osd_canvas_height maximum
++#define DIFF_COLS 63    // osd_canvas_width maximum
++#else
++#define DIFF_ROWS VIDEO_LINES_PAL
++#define DIFF_COLS OSD_SD_COLS
++#endif
++#define DIFF_MAX_STALLS 200
++
++static uint8_t wantChar[DIFF_ROWS][DIFF_COLS];
++static uint8_t wantAttr[DIFF_ROWS][DIFF_COLS];
++static uint8_t sentChar[DIFF_ROWS][DIFF_COLS];
++static uint8_t sentAttr[DIFF_ROWS][DIFF_COLS];
++static bool resyncPending = true;
++static uint8_t flushRow;
++static uint8_t refreshRow;
++static uint16_t flushStalls;
++
++static int diffRows(const displayPort_t *displayPort)
++{
++    return MIN(displayPort->rows, DIFF_ROWS);
++}
++
++static int diffCols(const displayPort_t *displayPort)
++{
++    return MIN(displayPort->cols, DIFF_COLS);
++}
++
++// The serial buffer is full: try again on the next call, but give up on a port that never drains.
++static bool flushStalled(void)
++{
++    if (++flushStalls < DIFF_MAX_STALLS) {
++        return true;
++    }
++
++    flushStalls = 0;
++    resyncPending = true;
++
++    return false;
++}
++
++// Sends what changed since the last flush. Returns true while more is left because the serial buffer
++// filled up; the next call carries on from there.
++static bool flushChanges(displayPort_t *displayPort)
++{
++    if (displayPortSerial == SERIAL_PORT_NONE) {
++        return false;
++    }
++
++    if (resyncPending) {
++        uint8_t subcmd[] = { MSP_DP_CLEAR_SCREEN };
++
++        if (output(displayPort, MSP_DISPLAYPORT, subcmd, sizeof(subcmd)) <= 0) {
++            return flushStalled();
++        }
++
++        memset(sentChar, ' ', sizeof(sentChar));
++        memset(sentAttr, 0, sizeof(sentAttr));
++        resyncPending = false;
++        flushRow = 0;
++    }
++
++    const int rows = diffRows(displayPort);
++    const int cols = diffCols(displayPort);
++
++    for (; flushRow < rows; flushRow++) {
++        const int row = flushRow;
++        int col = 0;
++
++        while (col < cols) {
++            if (wantChar[row][col] == sentChar[row][col] && wantAttr[row][col] == sentAttr[row][col]) {
++                col++;
++                continue;
++            }
++
++            // One string per run of cells with the same attribute, ending at the run's last changed cell.
++            const int start = col;
++            const uint8_t attr = wantAttr[row][col];
++            int end = col;
++
++            for (int i = col; i < cols && i - start < MSP_OSD_MAX_STRING_LENGTH && wantAttr[row][i] == attr; i++) {
++                if (wantChar[row][i] != sentChar[row][i] || wantAttr[row][i] != sentAttr[row][i]) {
++                    end = i;
++                }
++            }
++
++            const int len = end - start + 1;
++
++            if (sendString(displayPort, start, row, attr, &wantChar[row][start], len) <= 0) {
++                return flushStalled();
++            }
++
++            flushStalls = 0;
++            memcpy(&sentChar[row][start], &wantChar[row][start], len);
++            memset(&sentAttr[row][start], attr, len);
++            col = end + 1;
++        }
++    }
++
++    flushRow = 0;
++
++    return false;
++}
++
+ static int release(displayPort_t *displayPort)
+ {
+     uint8_t subcmd[] = { MSP_DP_RELEASE };
+ 
++    // The device may show its own screen after a release, so start from a clear screen next time.
++    resyncPending = true;
++
+     return output(displayPort, MSP_DISPLAYPORT, subcmd, sizeof(subcmd));
+ }
+ 
+ static int clearScreen(displayPort_t *displayPort, displayClearOption_e options)
+ {
++    UNUSED(displayPort);
+     UNUSED(options);
+ 
+-    uint8_t subcmd[] = { MSP_DP_CLEAR_SCREEN };
++    memset(wantChar, ' ', sizeof(wantChar));
++    memset(wantAttr, 0, sizeof(wantAttr));
+ 
+-    return output(displayPort, MSP_DISPLAYPORT, subcmd, sizeof(subcmd));
++    return 0;
+ }
+ 
+ static bool drawScreen(displayPort_t *displayPort)
+ {
++    if (flushChanges(displayPort)) {
++        return true;
++    }
++
+     uint8_t subcmd[] = { MSP_DP_DRAW_SCREEN };
+     output(displayPort, MSP_DISPLAYPORT, subcmd, sizeof(subcmd));
+ 
+-    return 0;
++    const int rows = diffRows(displayPort);
++    if (rows > 0) {
++        refreshRow = (refreshRow + 1) % rows;
++        memset(sentChar[refreshRow], 0, sizeof(sentChar[refreshRow]));
++    }
++
++    return false;
+ }
+ 
+-static int screenSize(const displayPort_t *displayPort)
++// The CMS menus commit but never call drawScreen, and the OSD commits just before it draws.
++static void commitTransaction(displayPort_t *displayPort)
+ {
+-    return displayPort->rows * displayPort->cols;
++    flushChanges(displayPort);
+ }
+ 
+ static int writeString(displayPort_t *displayPort, uint8_t col, uint8_t row, uint8_t attr, const char *string)
+ {
+-#define MSP_OSD_MAX_STRING_LENGTH 30 // FIXME move this
+-    uint8_t buf[MSP_OSD_MAX_STRING_LENGTH + 4];
+-
+-    int len = strlen(string);
+-    if (len >= MSP_OSD_MAX_STRING_LENGTH) {
+-        len = MSP_OSD_MAX_STRING_LENGTH;
++    if (row >= diffRows(displayPort)) {
++        return 0;
+     }
+ 
+-    buf[0] = MSP_DP_WRITE_STRING;
+-    buf[1] = row;
+-    buf[2] = col;
+-    buf[3] = displayPortProfileMsp()->fontSelection[attr & (DISPLAYPORT_SEVERITY_COUNT - 1)] & DISPLAYPORT_MSP_ATTR_FONT;
++    const int cols = diffCols(displayPort);
++    const uint8_t mspAttr = mspAttribute(attr);
+ 
+-    if (attr & DISPLAYPORT_BLINK) {
+-        buf[3] |= DISPLAYPORT_MSP_ATTR_BLINK;
++    for (int i = 0; string[i] && col + i < cols; i++) {
++        wantChar[row][col + i] = string[i];
++        wantAttr[row][col + i] = mspAttr;
+     }
+ 
+-    memcpy(&buf[4], string, len);
++    return 0;
++}
++#else
++static int release(displayPort_t *displayPort)
++{
++    uint8_t subcmd[] = { MSP_DP_RELEASE };
+ 
+-    return output(displayPort, MSP_DISPLAYPORT, buf, len + 4);
++    return output(displayPort, MSP_DISPLAYPORT, subcmd, sizeof(subcmd));
++}
++
++static int clearScreen(displayPort_t *displayPort, displayClearOption_e options)
++{
++    UNUSED(options);
++
++    uint8_t subcmd[] = { MSP_DP_CLEAR_SCREEN };
++
++    return output(displayPort, MSP_DISPLAYPORT, subcmd, sizeof(subcmd));
+ }
+ 
++static bool drawScreen(displayPort_t *displayPort)
++{
++    uint8_t subcmd[] = { MSP_DP_DRAW_SCREEN };
++    output(displayPort, MSP_DISPLAYPORT, subcmd, sizeof(subcmd));
++
++    return 0;
++}
++
++static int writeString(displayPort_t *displayPort, uint8_t col, uint8_t row, uint8_t attr, const char *string)
++{
++    return sendString(displayPort, col, row, mspAttribute(attr), (const uint8_t *)string, strlen(string));
++}
++#endif // USE_MSP_DISPLAYPORT_DIFF
++
+ static int writeSys(displayPort_t *displayPort, uint8_t col, uint8_t row, displayPortSystemElement_e systemElement)
+ {
+     uint8_t syscmd[4];
+@@ -167,6 +355,9 @@
+ 
+ static void redraw(displayPort_t *displayPort)
+ {
++#ifdef USE_MSP_DISPLAYPORT_DIFF
++    resyncPending = true;
++#endif
+     drawScreen(displayPort);
+ }
+ 
+@@ -235,12 +426,20 @@
+     .layerSupported = NULL,
+     .layerSelect = NULL,
+     .layerCopy = NULL,
++#ifdef USE_MSP_DISPLAYPORT_DIFF
++    .commitTransaction = commitTransaction,
++#endif
+ };
+ 
+ displayPort_t *displayPortMspInit(void)
+ {
+     displayInit(&mspDisplayPort, &mspDisplayPortVTable, DISPLAYPORT_DEVICE_TYPE_MSP);
+ 
++#ifdef USE_MSP_DISPLAYPORT_DIFF
++    clearScreen(&mspDisplayPort, DISPLAY_CLEAR_NONE);
++    resyncPending = true;
++#endif
++
+     if (displayPortProfileMsp()->useDeviceBlink) {
+         mspDisplayPort.useDeviceBlink = true;
+     }
